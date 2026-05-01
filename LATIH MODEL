@@ -1,0 +1,244 @@
+import os
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
+
+print(f"TensorFlow Version: {tf.__version__}")
+
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+# PERHATIAN: Ganti path ini dengan lokasi folder dataset ko di Google Drive!
+dataset_dir = '/content/drive/MyDrive/Clothes_Dataset'
+
+filepaths = []
+labels = []
+
+# Membaca folder dan membuat list jalur file beserta labelnya
+for folder in os.listdir(dataset_dir):
+    folder_path = os.path.join(dataset_dir, folder)
+    if os.path.isdir(folder_path):
+        for file in os.listdir(folder_path):
+            filepaths.append(os.path.join(folder_path, file))
+            labels.append(folder) # Nama folder jadi nama kelas
+
+# Memasukkan ke DataFrame
+df = pd.DataFrame({'image_path': filepaths, 'label': labels})
+
+# Split data: 70% Train, 15% Val, 15% Test (Stratified biar proporsi kelas seimbang)
+train_df, dummy_df = train_test_split(df, test_size=0.3, random_state=42, stratify=df['label'])
+val_df, test_df = train_test_split(dummy_df, test_size=0.5, random_state=42, stratify=dummy_df['label'])
+
+print(f"Total Gambar Training: {len(train_df)}")
+print(f"Total Gambar Validation: {len(val_df)}")
+print(f"Total Gambar Testing: {len(test_df)}")
+
+
+plt.figure(figsize=(12, 6))
+# Tampilkan 10 gambar pertama dari data training
+for i in range(10):
+    plt.subplot(2, 5, i+1)
+    img = cv2.imread(train_df['image_path'].iloc[i])
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # Ubah BGR ke RGB biar warna tra aneh
+    plt.imshow(img)
+    plt.title(train_df['label'].iloc[i])
+    plt.axis('off')
+plt.tight_layout()
+plt.show()
+
+
+plt.figure(figsize=(8, 5))
+sns.countplot(data=df, x='label', order=df['label'].value_counts().index, palette='viridis')
+plt.title('Distribusi Data per Kelas (Analisis Potensi Bias)')
+plt.ylabel('Jumlah Gambar')
+plt.xlabel('Kelas')
+plt.xticks(rotation=45)
+plt.show()
+
+
+# Setelan HD untuk GPU T4
+img_size, batch_size = (224, 224), 32
+
+# Augmentasi halus untuk data training
+gen = ImageDataGenerator(
+    rescale=1./255,
+    rotation_range=15,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    zoom_range=0.1,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+
+# Data validasi & test TRA BOLEH di-augmentasi, cukup di-rescale saja!
+val_gen = ImageDataGenerator(rescale=1./255)
+
+train_generator = gen.flow_from_dataframe(train_df, x_col='image_path', y_col='label', target_size=img_size, batch_size=batch_size)
+val_generator = val_gen.flow_from_dataframe(val_df, x_col='image_path', y_col='label', target_size=img_size, batch_size=batch_size)
+# Shuffle = False WAJIB untuk test_generator biar matriks evaluasinya tra acak-acakan
+test_generator = val_gen.flow_from_dataframe(test_df, x_col='image_path', y_col='label', target_size=img_size, batch_size=batch_size, shuffle=False)
+
+
+# Panggil Base Model
+base = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224,224,3))
+
+# Buka 50 layer terakhir biar akurasi meledak
+base.trainable = True
+for layer in base.layers[:-50]:
+    layer.trainable = False
+
+# Bangun Arsitektur
+model = models.Sequential([
+    base,
+    layers.GlobalAveragePooling2D(),
+    layers.BatchNormalization(),
+    layers.Dropout(0.4),
+    layers.Dense(5, activation='softmax') # FOKUS 5 KELAS
+])
+
+model.compile(optimizer=optimizers.Adam(learning_rate=1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Callbacks untuk menyimpan otak terbaik
+cb = [
+    ModelCheckpoint('model_terbaik_5kelas.weights.h5', monitor='val_accuracy', save_best_only=True, save_weights_only=True, verbose=1),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+]
+
+print("--- 🚀 MEMULAI TRAINING DI GPU T4 ---")
+history = model.fit(
+    train_generator,
+    epochs=50,
+    validation_data=val_generator,
+    callbacks=cb,
+    verbose=1
+)
+
+
+# Panggil bobot terbaik yang diselamatkan oleh ModelCheckpoint
+model.load_weights('model_terbaik_5kelas.weights.h5')
+
+print("\n--- Evaluasi Akhir pada Data Ujian (Test Set) ---")
+test_loss, test_acc = model.evaluate(test_generator, verbose=1)
+print(f"🎯 Akurasi Bersih (Test Accuracy): {test_acc*100:.2f}%")
+
+
+plt.style.use('seaborn-v0_8-whitegrid')
+plt.figure(figsize=(12, 5))
+
+# Grafik Akurasi
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'], label='Train Acc', linewidth=2)
+plt.plot(history.history['val_accuracy'], label='Val Acc', linewidth=2, linestyle='--')
+plt.title('Kurva Akurasi Model', fontsize=14, pad=10)
+plt.xlabel('Epoch'); plt.ylabel('Accuracy')
+plt.legend(); plt.grid(True)
+
+# Grafik Loss
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'], label='Train Loss', linewidth=2)
+plt.plot(history.history['val_loss'], label='Val Loss', linewidth=2, linestyle='--')
+plt.title('Kurva Loss (Tingkat Kesalahan)', fontsize=14, pad=10)
+plt.xlabel('Epoch'); plt.ylabel('Loss')
+plt.legend(); plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+
+# AI menebak data test
+preds = model.predict(test_generator)
+y_pred = np.argmax(preds, axis=1)
+y_true = test_generator.classes
+
+# Ambil nama 5 kelas dari generator
+class_names = list(test_generator.class_indices.keys())
+
+print("--- Laporan Klasifikasi Lengkap ---")
+print(classification_report(y_true, y_pred, target_names=class_names))
+
+# Menggambar Confusion Matrix
+plt.figure(figsize=(8, 6))
+cm = confusion_matrix(y_true, y_pred)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+plt.title('Confusion Matrix Model 5 Kelas', fontsize=14)
+plt.ylabel('Label Asli', fontsize=12)
+plt.xlabel('Label Prediksi AI', fontsize=12)
+plt.show()
+
+
+def get_gradcam(img, model):
+    base_model = model.layers[0]
+    extractor = tf.keras.models.Model(
+        inputs=base_model.inputs,
+        outputs=[base_model.get_layer('out_relu').output, base_model.output]
+    )
+
+    with tf.GradientTape() as tape:
+        conv_out, base_out = extractor(img)
+        tape.watch(conv_out)
+
+        x = base_out
+        for layer in model.layers[1:]:
+            x = layer(x)
+
+        preds = x
+        loss = preds[:, tf.argmax(preds[0])]
+
+    grads = tape.gradient(loss, conv_out)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+    # Perkalian matriks yang aman (Keras 3 Compatible)
+    hm = tf.reduce_sum(tf.multiply(conv_out[0], pooled_grads), axis=-1)
+    hm = tf.maximum(hm, 0)
+    hm = hm.numpy()
+
+    max_val = np.max(hm)
+    if max_val != 0:
+        hm = hm / max_val
+
+    return hm
+
+# TES VISUALISASI
+idx = 0 # Ganti angka ini untuk tes gambar lain (0, 1, 2, dst)
+img_size = (224, 224)
+
+# Ambil gambar asli
+raw_img = cv2.imread(test_df.iloc[idx]['image_path'])
+raw_rgb = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
+raw_resized = cv2.resize(raw_rgb, img_size)
+
+# Buat Heatmap
+img_tensor = np.expand_dims(raw_resized / 255.0, 0)
+hm = get_gradcam(img_tensor, model)
+hm_resized = cv2.resize(hm, img_size)
+
+# Tampilkan Hasil
+plt.figure(figsize=(10, 5))
+plt.subplot(1, 2, 1)
+plt.imshow(raw_resized)
+plt.title(f"Gambar Asli\n(Label: {test_df.iloc[idx]['label']})")
+plt.axis('off')
+
+plt.subplot(1, 2, 2)
+plt.imshow(raw_resized)
+plt.imshow(hm_resized, cmap='jet', alpha=0.4)
+plt.title("Fokus AI (Grad-CAM)")
+plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+
